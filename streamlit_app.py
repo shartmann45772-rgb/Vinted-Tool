@@ -79,7 +79,9 @@ class ProductInfo:
     raw: dict = field(default_factory=dict)
 
 
-EXTRACTION_PROMPT = """Du siehst einen Screenshot eines Vinted-Inserats.
+EXTRACTION_PROMPT = """Du siehst ein oder mehrere Screenshots DESSELBEN Vinted-Inserats (z.B. einen
+vom Produktfoto und einen von der Beschreibung/dem Preis, weil man auf dem Handy oft scrollen muss).
+Kombiniere die Informationen aus ALLEN Bildern zu einem Ergebnis.
 Extrahiere folgende Felder als reines JSON-Objekt (keine Erklärung, kein Markdown, nur JSON):
 
 {
@@ -101,9 +103,11 @@ sichtbaren Titel weg, auch wenn dir die Marke oder Kollektion unbekannt ist.
 Wenn ein Feld nicht erkennbar ist, setze es auf null. Antworte NUR mit dem JSON-Objekt."""
 
 
-def extract_product_info(image_bytes: bytes) -> ProductInfo:
-    image_part = {"mime_type": "image/png", "data": image_bytes}
-    response = _model.generate_content([EXTRACTION_PROMPT, image_part])
+def extract_product_info(images_bytes: list) -> ProductInfo:
+    """Nimmt eine LISTE von Screenshots entgegen (z.B. eins vom Produktfoto, eins von der
+    Beschreibung/Preis) und kombiniert die Infos daraus in einer einzigen Anfrage."""
+    image_parts = [{"mime_type": "image/png", "data": b} for b in images_bytes]
+    response = _model.generate_content([EXTRACTION_PROMPT, *image_parts])
     text = re.sub(r"^```json|```$", "", response.text.strip(), flags=re.MULTILINE).strip()
 
     try:
@@ -352,27 +356,31 @@ def evaluate(info: ProductInfo, reference_image_bytes: bytes, log: list) -> dict
 # Web-Oberfläche (Gradio)
 # ---------------------------------------------------------------------------
 
-def analyze_screenshot(image: Image.Image) -> str:
-    if image is None:
-        return "Bitte zuerst ein Bild hochladen."
+def analyze_screenshot(images: list) -> str:
+    if not images:
+        return "Bitte zuerst mindestens ein Bild hochladen."
 
     log = []
     try:
-        buf = io.BytesIO()
-        image.convert("RGB").save(buf, format="PNG")
-        img_bytes = buf.getvalue()
+        images_bytes = []
+        for image in images:
+            buf = io.BytesIO()
+            image.convert("RGB").save(buf, format="PNG")
+            images_bytes.append(buf.getvalue())
 
-        log.append("Analysiere Produkt mit Gemini...")
-        info = extract_product_info(img_bytes)
+        log.append(f"Analysiere {len(images_bytes)} Bild(er) mit Gemini...")
+        info = extract_product_info(images_bytes)
 
         if not info.search_query:
-            return "Konnte keinen Suchbegriff aus dem Bild erkennen. Ist der Screenshot deutlich genug?"
+            return "Konnte keinen Suchbegriff aus den Bildern erkennen. Sind die Screenshots deutlich genug?"
 
         log.append(f"Erkannt: {info.brand} / {info.model} | Größe: {info.size} | Farbe: {info.color}")
         log.append(f"Suchbegriff: '{info.search_query}'")
         log.append("Suche auf Vinted...")
 
-        result = evaluate(info, img_bytes, log)
+        # Das erste hochgeladene Bild dient als Referenzfoto für den Bildabgleich
+        # (im Idealfall lädst du das Produktfoto als erstes Bild hoch).
+        result = evaluate(info, images_bytes[0], log)
 
         lines = ["\n".join(log), "\n---\n"]
         lines.append(f"**Treffer verglichen:** {result['matched_count']}")
@@ -405,18 +413,25 @@ def analyze_screenshot(image: Image.Image) -> str:
 st.set_page_config(page_title="Vinted Preis-Checker", page_icon="🛍️")
 st.title("🛍️ Vinted Preis-Checker")
 st.write(
-    "Lade einen Screenshot eines Vinted-Inserats hoch. Das Tool erkennt Marke, Modell, "
-    "Größe, Farbe und Preis, sucht vergleichbare Artikel auf Vinted und berechnet deine "
-    "Marge inklusive Versand und Käuferschutz."
+    "Lade 1-2 Screenshots desselben Vinted-Inserats hoch (z.B. einen vom Produktfoto und "
+    "einen von der Beschreibung/dem Preis, falls das auf dem Handy nicht in einen Screenshot "
+    "passt). Das Tool erkennt Marke, Modell, Größe, Farbe und Preis, sucht vergleichbare "
+    "Artikel auf Vinted und berechnet deine Marge inklusive Versand und Käuferschutz."
 )
 
-uploaded_file = st.file_uploader("Screenshot hochladen", type=["png", "jpg", "jpeg"])
+uploaded_files = st.file_uploader(
+    "Screenshot(s) hochladen",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+)
 
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    st.image(image, caption="Hochgeladener Screenshot", width=300)
+if uploaded_files:
+    images = [Image.open(f) for f in uploaded_files]
+    cols = st.columns(len(images))
+    for col, img in zip(cols, images):
+        col.image(img, width=200)
 
     if st.button("Analysieren", type="primary"):
         with st.spinner("Analysiere Produkt und suche auf Vinted..."):
-            result_text = analyze_screenshot(image)
+            result_text = analyze_screenshot(images)
         st.markdown(result_text)
